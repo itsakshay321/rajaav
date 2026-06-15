@@ -1,0 +1,957 @@
+
+ALTER PROCEDURE [SHM].[ShmCartonInformationImportSp]
+(
+    @pCartonInformationData  NVARCHAR(MAX)
+, @pShipmentBookingId      BIGINT
+, @pUserId                 BIGINT
+, @pCompanyId              BIGINT
+, @xRetCode                INT           OUT
+, @xMsg                    VARCHAR(2000) OUT
+, @xData                   TEXT          OUT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @lBookingType VARCHAR(30);
+    DECLARE @lJsonData NVARCHAR(MAX);
+    DECLARE @lMeterUomId         BIGINT;
+    DECLARE @lMeterConversionRate FLOAT;
+    DECLARE @lCartonDimUom       INT;
+
+    SET @lJsonData = @pCartonInformationData;
+
+    DROP TABLE IF EXISTS #tImportStage;
+
+    -- Staging: holds parsed Excel rows
+    CREATE TABLE #tImportStage
+    (
+        RowNum                INT
+        , BookingNum            VARCHAR(60)
+        , BookingType           VARCHAR(30)
+        , OrderRef              VARCHAR(120)
+        , InternalOrderRef      VARCHAR(120)
+        , StyleAttribute        VARCHAR(500)
+        , BookingQty            BIGINT
+        , Destination           NVARCHAR(240)
+        , AttributeRefKey       BIGINT
+        , LinkedAttributeRefKey VARCHAR(500)
+        , PackType              VARCHAR(60)
+        , LineType              VARCHAR(500)
+        , Dimension             VARCHAR(50)
+        , CartonLength          DECIMAL(10, 4)
+        , CartonWidth           DECIMAL(10, 4)
+        , CartonHeight          DECIMAL(10, 4)
+        , CartonWeight          DECIMAL(18, 4)
+        , NoOfCartons           INT
+        , AssortmentQty         INT
+        , AssortmentNum         INT
+        , Remarks               NVARCHAR(500)
+        , ParentCartonInfoId    BIGINT
+        , ErrorMsg              NVARCHAR(MAX) NULL
+        , ResultMsg             NVARCHAR(MAX) NULL
+        , Created               INT NULL
+        , ParentRowNum          INT
+        , NewParentCartonDimensionId  BIGINT NULL  -- resolved ShipmentBookingCartonDimensionId of parent BCD row
+    );
+
+    -- Captures PKs of parent BCD rows inserted/updated in this run; used to resolve child ParentCartonDimensionId
+    DROP TABLE IF EXISTS #tInsertedOutput;
+    CREATE TABLE #tInsertedOutput
+    (
+        SourceRowNum   INT
+        , ActualId       BIGINT
+    );
+
+    -- contains existing ShmShipmentBookingCartonDimension data + linkedRefAttributes
+    DROP TABLE IF EXISTS #tExistingBCD;
+
+    CREATE TABLE #tExistingBCD
+    (
+        ShipmentBookingCartonDimensionId BIGINT,
+        CartonInfoId BIGINT,
+        ParentCartonInfoId BIGINT NULL,
+        ParentCartonDimensionId BIGINT NULL,
+        CartonLength DECIMAL(10,4),
+        CartonWidth DECIMAL(10,4),
+        CartonHeight DECIMAL(10,4),
+        LinkedAttributeRefKey VARCHAR(500)
+    );
+
+    BEGIN TRY
+        SET @xRetCode = 1;
+        SET @xMsg = '';
+
+        IF NOT EXISTS (
+            SELECT 1
+            FROM SHM.ShmShipmentBooking
+            WHERE ShipmentBookingId = @pShipmentBookingId
+              AND Active = 'Y'
+        )
+            BEGIN
+                SET @xRetCode = -1;
+                SET @xMsg = 'Shipment Booking not found or is inactive.';
+                SET @xData = CAST((SELECT @xMsg AS ResultMsg, @xMsg AS ErrorMsg, 0 AS Created FOR JSON PATH) AS TEXT);
+                SELECT @xMsg AS ResultMsg, @xMsg AS ErrorMsg, 0 AS Created;
+                RETURN;
+            END;
+
+        SELECT @lBookingType   = BookingType,
+               @lCartonDimUom  = CartonDimensionUom
+        FROM SHM.ShmShipmentBooking
+        WHERE ShipmentBookingId = @pShipmentBookingId;
+
+        -- Get conversion rate from the booking's dimension UOM to metres; used for CBM calculation
+        SET @lMeterUomId = (SELECT TOP 1 UomId FROM PDM.PdmUom WHERE UomCode = 'M');
+        SET @lMeterConversionRate = PDM.PdmStandardConversionFn(@pCompanyId, @lCartonDimUom, @lMeterUomId);
+
+        IF @lMeterConversionRate IS NULL OR @lMeterConversionRate = 0
+            BEGIN
+                SET @xRetCode = -1;
+                SET @xMsg = 'Carton Dimension UOM conversion rate to Metre not found. Please check UOM master setup.';
+                SET @xData = CAST((SELECT @xMsg AS ResultMsg, @xMsg AS ErrorMsg, 0 AS Created FOR JSON PATH) AS TEXT);
+                SELECT @xMsg AS ResultMsg, @xMsg AS ErrorMsg, 0 AS Created;
+                RETURN;
+            END;
+
+        -- Step 1: Parse JSON array into staging table
+        INSERT INTO #tImportStage
+        (
+          RowNum, BookingNum, BookingType, OrderRef, InternalOrderRef
+        , StyleAttribute, BookingQty, Destination, AttributeRefKey
+        , LinkedAttributeRefKey, PackType, LineType, Dimension
+        , CartonWeight, NoOfCartons, AssortmentQty, AssortmentNum, Remarks
+        )
+        SELECT
+            ROW_NUMBER() OVER (ORDER BY (SELECT NULL))
+             , TRIM(JSON_VALUE(P.value, '$."Booking#"'))
+             , REPLACE(UPPER(TRIM(JSON_VALUE(P.value, '$."Booking Type"'))), ' ', '_')
+             , TRIM(JSON_VALUE(P.value, '$."Order Ref"'))
+             , TRIM(JSON_VALUE(P.value, '$."Internal Order Ref"'))
+             , TRIM(JSON_VALUE(P.value, '$."Style Attribute"'))
+             , TRY_CAST(JSON_VALUE(P.value, '$."Booking Qty"') AS BIGINT)
+             , TRIM(JSON_VALUE(P.value, '$."Destination"'))
+             , TRY_CAST(JSON_VALUE(P.value, '$."Attribute Ref Key"') AS BIGINT)
+             , TRIM(REPLACE(REPLACE(REPLACE(TRIM(JSON_VALUE(P.value, '$."Linked Attribute Ref Key"')), ' ,', ','), ', ', ','), '  ', ' '))
+             , REPLACE(UPPER(TRIM(JSON_VALUE(P.value, '$."Pack Type"'))), ' ', '_')
+             , UPPER(TRIM(JSON_VALUE(P.value, '$."Line Type"')))
+             -- Dimension column header is dynamic
+             , TRIM((
+            SELECT TOP 1 [value]
+            FROM OPENJSON(P.value)
+            WHERE [key] LIKE 'Dimension (LxWxH)%'
+        ))
+             -- Carton Weight column header is dynamic
+             , TRY_CAST((
+            SELECT TOP 1 [value]
+            FROM OPENJSON(P.value)
+            WHERE [key] LIKE 'Carton Weight%'
+        ) AS DECIMAL(18, 4))
+             , TRY_CAST(JSON_VALUE(P.value, '$."No.of Cartons"') AS INT)
+             , TRY_CAST(JSON_VALUE(P.value, '$."Assortment Qty"') AS INT)
+             , TRY_CAST(COALESCE(
+                JSON_VALUE(P.value, '$."Assortment#"')
+            , JSON_VALUE(P.value, '$."Assortment #"')
+                        ) AS INT)
+             , TRIM(JSON_VALUE(P.value, '$."Remarks"'))
+        FROM OPENJSON(@lJsonData) P
+        WHERE NOT (
+            ISNULL(TRIM(JSON_VALUE(P.value, '$."Booking#"')), '') = ''
+            AND TRY_CAST(JSON_VALUE(P.value, '$."Attribute Ref Key"') AS BIGINT) IS NULL
+            AND ISNULL(TRIM(JSON_VALUE(P.value, '$."Order Ref"')), '') = ''
+            AND ISNULL(TRIM(JSON_VALUE(P.value, '$."Internal Order Ref"')), '') = ''
+        )
+          AND ISNULL(UPPER(TRIM(JSON_VALUE(P.value, '$."Line Type"'))), '') NOT LIKE 'MANDATORY%';
+
+        -- Remove template instruction / blank rows from Excel upload
+        DELETE FROM #tImportStage
+        WHERE ISNULL(TRIM(BookingNum), '') = ''
+          AND AttributeRefKey IS NULL
+          AND ISNULL(TRIM(OrderRef), '') = ''
+          AND ISNULL(TRIM(InternalOrderRef), '') = '';
+
+        IF NOT EXISTS (SELECT 1 FROM #tImportStage)
+            BEGIN
+                SET @xRetCode = -1;
+                SET @xMsg = 'No carton information rows received. Please check upload data / procedure parameter mapping.';
+                SET @xData = CAST((SELECT @xMsg AS ResultMsg, @xMsg AS ErrorMsg, 0 AS Created FOR JSON PATH) AS TEXT);
+                SELECT @xMsg AS ResultMsg, @xMsg AS ErrorMsg, 0 AS Created;
+                RETURN;
+            END;
+
+        -- Step 2: Split "LxWxH" Dimension string into CartonLength, CartonWidth, CartonHeight
+        -- Skips rows where Dimension is NULL/empty or doesn't have exactly 2 'x' separators
+        UPDATE #tImportStage
+        SET
+            CartonLength = TRY_CAST(
+                    SUBSTRING(Dimension, 1, CHARINDEX('x', Dimension) - 1)
+                AS DECIMAL(10, 4))
+          , CartonWidth  = TRY_CAST(
+                SUBSTRING(Dimension,
+                          CHARINDEX('x', Dimension) + 1,
+                          CHARINDEX('x', Dimension, CHARINDEX('x', Dimension) + 1)
+                              - CHARINDEX('x', Dimension) - 1)
+            AS DECIMAL(10, 4))
+          , CartonHeight = TRY_CAST(
+                SUBSTRING(Dimension,
+                          CHARINDEX('x', Dimension, CHARINDEX('x', Dimension) + 1) + 1,
+                          LEN(Dimension))
+            AS DECIMAL(10, 4))
+        WHERE Dimension IS NOT NULL
+          AND Dimension != ''
+          AND LEN(Dimension) - LEN(REPLACE(Dimension, 'x', '')) = 2;
+
+        -- Step 3: Derive ParentCartonInfoId from LinkedAttributeRefKey
+        -- Convention: first ID in the comma list is the parent; if it differs from own AttributeRefKey, this row is a child
+        UPDATE #tImportStage
+        SET ParentCartonInfoId =
+                CASE
+                    WHEN TRY_CAST(LEFT(LinkedAttributeRefKey, CHARINDEX(',', LinkedAttributeRefKey) - 1) AS BIGINT) != AttributeRefKey
+                        THEN TRY_CAST(LEFT(LinkedAttributeRefKey, CHARINDEX(',', LinkedAttributeRefKey) - 1) AS BIGINT)
+                    ELSE NULL
+                    END
+        WHERE LinkedAttributeRefKey IS NOT NULL
+          AND CHARINDEX(',', LinkedAttributeRefKey) > 0;
+
+        -- Step 3b: Link each child row to its parent staging row via matching group keys + parsed dimensions
+        -- Order-independent: parent can appear anywhere in the upload
+        UPDATE CHILD
+        SET CHILD.ParentRowNum = PARENT.RowNum
+        FROM #tImportStage CHILD
+                 JOIN #tImportStage PARENT
+                      ON  PARENT.LineType              = 'PARENT'
+                          AND PARENT.LinkedAttributeRefKey = CHILD.LinkedAttributeRefKey
+                          AND PARENT.PackType              = CHILD.PackType
+                          AND PARENT.CartonLength          = CHILD.CartonLength
+                          AND PARENT.CartonWidth           = CHILD.CartonWidth
+                          AND PARENT.CartonHeight          = CHILD.CartonHeight
+        WHERE CHILD.LineType = 'CHILD';
+
+        -- Validate: parent row's first LinkedAttributeRefKey token must equal its own AttributeRefKey
+        UPDATE ST
+        SET
+            ResultMsg = 'For Parent rows, the first value in Linked Attribute Ref Key must match Attribute Ref Key.',
+            ErrorMsg  = 'For Parent rows, the first value in Linked Attribute Ref Key must match Attribute Ref Key.',
+            Created = 0
+        FROM #tImportStage ST
+        WHERE ST.LineType = 'PARENT'
+          AND CHARINDEX(',', ST.LinkedAttributeRefKey) > 0
+          AND TRY_CAST(
+                      LEFT(ST.LinkedAttributeRefKey,
+                           CHARINDEX(',', ST.LinkedAttributeRefKey) - 1)
+                  AS BIGINT
+              ) <> ST.AttributeRefKey;
+
+        -- Validate: every CHILD must have a matching PARENT row in the same upload
+        UPDATE ST
+        SET
+            ResultMsg = CASE
+                            WHEN ResultMsg IS NULL
+                                THEN 'Child row has no matching Parent row in the upload for the same Linked Attribute Ref Key, Pack Type and Dimension.'
+                            ELSE ResultMsg + ', Child row has no matching Parent row in the upload for the same Linked Attribute Ref Key, Pack Type and Dimension.'
+                END,
+            ErrorMsg  = CASE
+                            WHEN ErrorMsg IS NULL
+                                THEN 'Child row has no matching Parent row in the upload for the same Linked Attribute Ref Key, Pack Type and Dimension.'
+                            ELSE ErrorMsg  + ', Child row has no matching Parent row in the upload for the same Linked Attribute Ref Key, Pack Type and Dimension.'
+                END,
+            Created = 0
+        FROM #tImportStage ST
+        WHERE ST.LineType  = 'CHILD'
+          AND ST.ParentRowNum IS NULL;
+
+        -- Step 4: Inherit dimension/weight/cartons from parent into child rows where child values are NULL
+        UPDATE CHILD
+        SET
+            CHILD.CartonLength = COALESCE(CHILD.CartonLength, PARENT.CartonLength)
+          , CHILD.CartonWidth  = COALESCE(CHILD.CartonWidth,  PARENT.CartonWidth)
+          , CHILD.CartonHeight = COALESCE(CHILD.CartonHeight, PARENT.CartonHeight)
+          , CHILD.CartonWeight = COALESCE(CHILD.CartonWeight, PARENT.CartonWeight)
+          , CHILD.NoOfCartons  = COALESCE(CHILD.NoOfCartons,  PARENT.NoOfCartons)
+        FROM #tImportStage CHILD
+                 JOIN #tImportStage PARENT ON PARENT.RowNum = CHILD.ParentRowNum
+        WHERE CHILD.LineType = 'CHILD';
+
+        -- Validations
+
+        -- V1: Style Attribute mandatory for PO COLOR / PO COLOR SIZE
+        UPDATE #tImportStage
+        SET ResultMsg = CASE WHEN ResultMsg IS NULL THEN CONCAT('Style Attribute is mandatory when Booking Type is ''', @lBookingType, '''.') ELSE ResultMsg + ', ' + CONCAT('Style Attribute is mandatory when Booking Type is ''', @lBookingType, '''.') END,
+            ErrorMsg  = CASE WHEN ErrorMsg  IS NULL THEN CONCAT('Style Attribute is mandatory when Booking Type is ''', @lBookingType, '''.') ELSE ErrorMsg  + ', ' + CONCAT('Style Attribute is mandatory when Booking Type is ''', @lBookingType, '''.') END,
+            Created = 0
+        WHERE (Created IS NULL OR Created = 0)
+          AND @lBookingType IN ('PO COLOR SIZE', 'PO COLOR')
+          AND (StyleAttribute IS NULL OR StyleAttribute = '');
+
+        -- V2: LineType mandatory and valid for Ratio / Multi PO
+        UPDATE #tImportStage
+        SET ResultMsg = CASE WHEN ResultMsg IS NULL THEN 'Line Type is mandatory when Pack Type is Ratio or Multi PO. Allowed values: Parent, Child.' ELSE ResultMsg + ', Line Type is mandatory when Pack Type is Ratio or Multi PO. Allowed values: Parent, Child.' END,
+            ErrorMsg  = CASE WHEN ErrorMsg  IS NULL THEN 'Line Type is mandatory when Pack Type is Ratio or Multi PO. Allowed values: Parent, Child.' ELSE ErrorMsg  + ', Line Type is mandatory when Pack Type is Ratio or Multi PO. Allowed values: Parent, Child.' END,
+            Created = 0
+        WHERE (Created IS NULL OR Created = 0)
+          AND PackType IN ('RATIO', 'MULTI PO')
+          AND (LineType IS NULL OR LineType NOT IN ('PARENT', 'CHILD'));
+
+        -- V3: Only one PARENT allowed per group (same PackType + LinkedAttributeRefKey + OrderRef + InternalOrderRef + parsed dims)
+        UPDATE ST
+        SET ST.ResultMsg = CASE WHEN ST.ResultMsg IS NULL THEN CONCAT('More than one Parent found in group with Linked Attribute Ref Key ''', ST.LinkedAttributeRefKey, '''. Only one line can be marked as Parent.') ELSE ST.ResultMsg + ', ' + CONCAT('More than one Parent found in group with Linked Attribute Ref Key ''', ST.LinkedAttributeRefKey, '''. Only one line can be marked as Parent.') END,
+            ST.ErrorMsg  = CASE WHEN ST.ErrorMsg  IS NULL THEN CONCAT('More than one Parent found in group with Linked Attribute Ref Key ''', ST.LinkedAttributeRefKey, '''. Only one line can be marked as Parent.') ELSE ST.ErrorMsg  + ', ' + CONCAT('More than one Parent found in group with Linked Attribute Ref Key ''', ST.LinkedAttributeRefKey, '''. Only one line can be marked as Parent.') END,
+            ST.Created = 0
+        FROM #tImportStage ST
+        WHERE (ST.Created IS NULL OR ST.Created = 0)
+          AND ST.PackType IN ('RATIO', 'MULTI PO')
+          AND ST.LineType = 'PARENT'
+          AND EXISTS (
+            SELECT 1
+            FROM #tImportStage ST2
+            WHERE ST2.PackType              = ST.PackType
+              AND ST2.LineType              = 'PARENT'
+              AND ST2.LinkedAttributeRefKey = ST.LinkedAttributeRefKey
+              AND ST2.OrderRef              = ST.OrderRef
+              AND ST2.InternalOrderRef      = ST.InternalOrderRef
+              AND ST2.CartonLength          = ST.CartonLength
+              AND ST2.CartonWidth           = ST.CartonWidth
+              AND ST2.CartonHeight          = ST.CartonHeight
+              AND ST2.RowNum               != ST.RowNum
+        );
+
+        -- V4: NoOfCartons mandatory for SOLID and PARENT rows
+        UPDATE #tImportStage
+        SET ResultMsg = CASE WHEN ResultMsg IS NULL THEN 'No. of Cartons is mandatory for Solid pack type, and for Parent rows of Ratio / Multi PO pack type.' ELSE ResultMsg + ', No. of Cartons is mandatory for Solid pack type, and for Parent rows of Ratio / Multi PO pack type.' END,
+            ErrorMsg  = CASE WHEN ErrorMsg  IS NULL THEN 'No. of Cartons is mandatory for Solid pack type, and for Parent rows of Ratio / Multi PO pack type.' ELSE ErrorMsg  + ', No. of Cartons is mandatory for Solid pack type, and for Parent rows of Ratio / Multi PO pack type.' END,
+            Created = 0
+        WHERE (Created IS NULL OR Created = 0)
+          AND NoOfCartons IS NULL
+          AND (PackType = 'SOLID' OR (PackType IN ('RATIO', 'MULTI PO') AND LineType = 'PARENT'))
+          AND (LineType IS NULL OR LineType != 'CHILD');
+
+        -- V5: CartonWeight mandatory for SOLID and PARENT rows
+        UPDATE #tImportStage
+        SET ResultMsg = CASE WHEN ResultMsg IS NULL THEN 'Carton Weight is mandatory for Solid pack type, and for Parent rows of Ratio / Multi PO pack type.' ELSE ResultMsg + ', Carton Weight (KGM) is mandatory for Solid pack type, and for Parent rows of Ratio / Multi PO pack type.' END,
+            ErrorMsg  = CASE WHEN ErrorMsg  IS NULL THEN 'Carton Weight is mandatory for Solid pack type, and for Parent rows of Ratio / Multi PO pack type.' ELSE ErrorMsg  + ', Carton Weight (KGM) is mandatory for Solid pack type, and for Parent rows of Ratio / Multi PO pack type.' END,
+            Created = 0
+        WHERE (Created IS NULL OR Created = 0)
+          AND CartonWeight IS NULL
+          AND (PackType = 'SOLID' OR (PackType IN ('RATIO', 'MULTI PO') AND LineType = 'PARENT'));
+
+        -- V6: Dimension string present but failed to parse (not numeric LxWxH format)
+        UPDATE #tImportStage
+        SET ResultMsg = CASE WHEN ResultMsg IS NULL THEN 'Wrong Carton Dimension format. Expected numeric LxWxH (e.g. 10x20x30).' ELSE ResultMsg + ', Wrong Carton Dimension format. Expected numeric LxWxH (e.g. 10x20x30).' END,
+            ErrorMsg  = CASE WHEN ErrorMsg  IS NULL THEN 'Wrong Carton Dimension format. Expected numeric LxWxH (e.g. 10x20x30).' ELSE ErrorMsg  + ', Wrong Carton Dimension format. Expected numeric LxWxH (e.g. 10x20x30).' END,
+            Created = 0
+        WHERE (Created IS NULL OR Created = 0)
+          AND Dimension IS NOT NULL
+          AND Dimension != ''
+          AND (CartonLength IS NULL OR CartonWidth IS NULL OR CartonHeight IS NULL)
+          AND (LineType IS NULL OR LineType != 'CHILD');
+
+
+        -- V7: AttributeRefKey must exist as an active CartonInfo record for this booking
+        UPDATE ST
+        SET ST.ResultMsg = CASE WHEN ST.ResultMsg IS NULL THEN 'Attribute Ref Key not found in this Shipment Booking.' ELSE ST.ResultMsg + ', Attribute Ref Key (CartonInfoId) not found in this Shipment Booking.' END,
+            ST.ErrorMsg  = CASE WHEN ST.ErrorMsg  IS NULL THEN 'Attribute Ref Key not found in this Shipment Booking.' ELSE ST.ErrorMsg  + ', Attribute Ref Key (CartonInfoId) not found in this Shipment Booking.' END,
+            ST.Created = 0
+        FROM #tImportStage ST
+        WHERE (ST.Created IS NULL OR ST.Created = 0)
+          AND NOT EXISTS (
+            SELECT 1
+            FROM SHM.ShmShipmentBookingCartonInfo BCI
+            WHERE BCI.CartonInfoId    = ST.AttributeRefKey
+              AND BCI.ShipmentBookingId = @pShipmentBookingId
+              AND BCI.Active          = 'Y'
+        );
+
+        -- V8a: OrderRef must match what is stored against the AttributeRefKey in BCI
+        UPDATE ST
+        SET
+            ResultMsg = CASE
+                            WHEN ResultMsg IS NULL
+                                THEN 'Order Ref does not match the Attribute Ref Key.'
+                            ELSE ResultMsg + ', Order Ref does not match the Attribute Ref Key.'
+                END,
+            ErrorMsg = CASE
+                           WHEN ErrorMsg IS NULL
+                               THEN 'Order Ref does not match the Attribute Ref Key.'
+                           ELSE ErrorMsg + ', Order Ref does not match the Attribute Ref Key.'
+                END,
+            Created = 0
+        FROM #tImportStage ST
+        WHERE NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM SHM.ShmShipmentBookingCartonInfo BCI
+                      WHERE BCI.ShipmentBookingId = @pShipmentBookingId
+                        AND BCI.CartonInfoId = ST.AttributeRefKey
+                        AND ISNULL(BCI.OrderRef,'') = ISNULL(ST.OrderRef,'')
+                        AND BCI.Active = 'Y'
+                  );
+
+        -- V8b: InternalOrderRef must match what is stored against the AttributeRefKey in BCI
+        UPDATE ST
+        SET
+            ResultMsg = CASE
+                            WHEN ResultMsg IS NULL
+                                THEN 'Internal Order Ref does not match the Attribute Ref Key.'
+                            ELSE ResultMsg + ', Internal Order Ref does not match the Attribute Ref Key.'
+                END,
+            ErrorMsg = CASE
+                           WHEN ErrorMsg IS NULL
+                               THEN 'Internal Order Ref does not match the Attribute Ref Key.'
+                           ELSE ErrorMsg + ', Internal Order Ref does not match the Attribute Ref Key.'
+                END,
+            Created = 0
+        FROM #tImportStage ST
+        WHERE NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM SHM.ShmShipmentBookingCartonInfo BCI
+                      WHERE BCI.ShipmentBookingId = @pShipmentBookingId
+                        AND BCI.CartonInfoId = ST.AttributeRefKey
+                        AND ISNULL(BCI.InternalOrderRef,'') = ISNULL(ST.InternalOrderRef,'')
+                        AND BCI.Active = 'Y'
+                  );
+
+        -- V8c: BookingNum in the row must match the DocumentNo of the selected booking
+        UPDATE ST
+        SET
+            ResultMsg = CASE
+                            WHEN ResultMsg IS NULL
+                                THEN 'Booking Number does not match the selected Shipment Booking.'
+                            ELSE ResultMsg + ', Booking Number does not match the selected Shipment Booking.'
+                END,
+            ErrorMsg = CASE
+                           WHEN ErrorMsg IS NULL
+                               THEN 'Booking Number does not match the selected Shipment Booking.'
+                           ELSE ErrorMsg + ', Booking Number does not match the selected Shipment Booking.'
+                END,
+            Created = 0
+        FROM #tImportStage ST
+        WHERE NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM SHM.ShmShipmentBooking SB
+                      WHERE SB.ShipmentBookingId = @pShipmentBookingId
+                        AND ISNULL(SB.DocumentNo,'') = ISNULL(ST.BookingNum,'')
+                        AND SB.Active = 'Y'
+                  );
+
+        -- V8d: BookingType in the row must match the BookingType of the selected booking
+        UPDATE ST
+        SET
+            ResultMsg = CASE
+                            WHEN ResultMsg IS NULL
+                                THEN 'Booking Type does not match the selected Shipment Booking.'
+                            ELSE ResultMsg + ', Booking Type does not match the selected Shipment Booking.'
+                END,
+            ErrorMsg = CASE
+                           WHEN ErrorMsg IS NULL
+                               THEN 'Booking Type does not match the selected Shipment Booking.'
+                           ELSE ErrorMsg + ', Booking Type does not match the selected Shipment Booking.'
+                END,
+            Created = 0
+        FROM #tImportStage ST
+        WHERE NOT EXISTS
+                  (
+                      SELECT 1
+                      FROM SHM.ShmShipmentBooking SB
+                      WHERE SB.ShipmentBookingId = @pShipmentBookingId
+                        AND UPPER(ISNULL(SB.BookingType,'')) = UPPER(ISNULL(ST.BookingType,''))
+                        AND SB.Active = 'Y'
+                  );
+
+        -- V9: Parent CartonInfoId (from LinkedAttributeRefKey) must exist in this booking
+        UPDATE ST
+        SET ST.ResultMsg = CASE WHEN ST.ResultMsg IS NULL THEN CONCAT('Linked Attribute Ref Key contains parent CartonInfoId (', ST.ParentCartonInfoId, ') which was not found in this Shipment Booking.') ELSE ST.ResultMsg + ', ' + CONCAT('Linked Attribute Ref Key contains parent CartonInfoId (', ST.ParentCartonInfoId, ') which was not found in this Shipment Booking.') END,
+            ST.ErrorMsg  = CASE WHEN ST.ErrorMsg  IS NULL THEN CONCAT('Linked Attribute Ref Key contains parent CartonInfoId (', ST.ParentCartonInfoId, ') which was not found in this Shipment Booking.') ELSE ST.ErrorMsg  + ', ' + CONCAT('Linked Attribute Ref Key contains parent CartonInfoId (', ST.ParentCartonInfoId, ') which was not found in this Shipment Booking.') END,
+            ST.Created = 0
+        FROM #tImportStage ST
+        WHERE (ST.Created IS NULL OR ST.Created = 0)
+          AND ST.ParentCartonInfoId IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1
+            FROM SHM.ShmShipmentBookingCartonInfo BCI
+            WHERE BCI.CartonInfoId    = ST.ParentCartonInfoId
+              AND BCI.ShipmentBookingId = @pShipmentBookingId
+              AND BCI.Active          = 'Y'
+        );
+
+        -- V10: Sum of AssortmentQty per AttributeRefKey must equal total BookingQty mapped to that CartonInfoId
+        ;WITH CTE_AssortmentQty AS
+                  (
+                      SELECT
+                          AttributeRefKey,
+                          SUM(AssortmentQty) AS TotalAssortmentQty
+                      FROM #tImportStage
+                      WHERE AssortmentQty IS NOT NULL
+                      GROUP BY AttributeRefKey
+                  ),
+              CTE_BookingQty AS
+                  (
+                      SELECT
+                          BOCM.CartonInfoId,
+                          SUM(BOL.BookingQty) AS TotalBookingQty
+                      FROM SHM.ShmShipmentBookingOrderCartonMap BOCM
+                               JOIN SHM.ShmShipmentBookingOrderLine BOL
+                                    ON BOL.ShipmentBookingOrderLineId =
+                                       BOCM.ShipmentBookingOrderLineId
+                      WHERE BOCM.Active = 'Y'
+                        AND BOL.Active             = 'Y'
+                        AND BOCM.ShipmentBookingId = @pShipmentBookingId
+                      GROUP BY BOCM.CartonInfoId
+                  )
+         UPDATE ST
+         SET
+             ST.ResultMsg =
+                 CASE
+                     WHEN ST.ResultMsg IS NULL
+                         THEN CONCAT(
+                             'Total Assortment Qty (', A.TotalAssortmentQty,
+                             ') does not match Booking Qty (', B.TotalBookingQty,
+                             ') for Attribute Ref Key ', ST.AttributeRefKey, '.'
+                              )
+                     ELSE ST.ResultMsg + ', ' + CONCAT(
+                             'Total Assortment Qty (', A.TotalAssortmentQty,
+                             ') does not match Booking Qty (', B.TotalBookingQty,
+                             ') for Attribute Ref Key ', ST.AttributeRefKey, '.'
+                                                )
+                     END,
+             ST.ErrorMsg =
+                 CASE
+                     WHEN ST.ErrorMsg IS NULL
+                         THEN CONCAT(
+                             'Total Assortment Qty (', A.TotalAssortmentQty,
+                             ') does not match Booking Qty (', B.TotalBookingQty,
+                             ') for Attribute Ref Key ', ST.AttributeRefKey, '.'
+                              )
+                     ELSE ST.ErrorMsg + ', ' + CONCAT(
+                             'Total Assortment Qty (', A.TotalAssortmentQty,
+                             ') does not match Booking Qty (', B.TotalBookingQty,
+                             ') for Attribute Ref Key ', ST.AttributeRefKey, '.'
+                                               )
+                     END,
+             ST.Created = 0
+         FROM #tImportStage ST
+                  JOIN CTE_AssortmentQty A
+                       ON A.AttributeRefKey = ST.AttributeRefKey
+                  JOIN CTE_BookingQty B
+                       ON B.CartonInfoId = ST.AttributeRefKey
+         WHERE (ST.Created IS NULL OR ST.Created = 0)
+           AND ST.AssortmentQty IS NOT NULL
+           AND A.TotalAssortmentQty <> B.TotalBookingQty;
+
+        -- Abort if any row failed validation; return all rows so the caller can surface all errors
+        IF EXISTS (SELECT 1 FROM #tImportStage WHERE Created = 0)
+            BEGIN
+                SET @xRetCode = -1;
+
+                SELECT TOP 1 @xMsg = 'Validation failed: ' + ResultMsg
+                FROM #tImportStage
+                WHERE Created = 0
+                ORDER BY RowNum;
+
+                SET @xData = CAST((SELECT * FROM #tImportStage FOR JSON PATH) AS TEXT);
+                SELECT * FROM #tImportStage;
+                RETURN;
+            END;
+
+            ;WITH ParentGroups AS
+                      (
+                          SELECT
+                              P.ShipmentBookingCartonDimensionId,
+
+                              CASE
+                                  WHEN COUNT(C.CartonInfoId) > 0
+                                      THEN CONCAT(
+                                          P.CartonInfoId,
+                                          ',',
+                                          STRING_AGG(
+                                                  CAST(C.CartonInfoId AS VARCHAR(20)),
+                                                  ','
+                                          ) WITHIN GROUP (ORDER BY C.CartonInfoId)
+                                           )
+                                  ELSE ''
+                                  END AS LinkedAttributeRefKey
+
+                          FROM SHM.ShmShipmentBookingCartonDimension P
+
+                                   LEFT JOIN SHM.ShmShipmentBookingCartonDimension C
+                                             ON C.ParentCartonDimensionId =
+                                                P.ShipmentBookingCartonDimensionId
+                                                 AND C.Active = 'Y'
+
+                          WHERE P.ShipmentBookingId = @pShipmentBookingId
+                            AND P.Active = 'Y'
+                            AND P.ParentCartonInfoId IS NULL
+
+                          GROUP BY
+                              P.ShipmentBookingCartonDimensionId,
+                              P.CartonInfoId
+                      )
+
+             INSERT INTO #tExistingBCD
+             (
+                 ShipmentBookingCartonDimensionId,
+                 CartonInfoId,
+                 ParentCartonInfoId,
+                 ParentCartonDimensionId,
+                 CartonLength,
+                 CartonWidth,
+                 CartonHeight,
+                 LinkedAttributeRefKey
+             )
+             SELECT
+                 BCD.ShipmentBookingCartonDimensionId,
+                 BCD.CartonInfoId,
+                 BCD.ParentCartonInfoId,
+                 BCD.ParentCartonDimensionId,
+                 BCD.CartonLength,
+                 BCD.CartonWidth,
+                 BCD.CartonHeight,
+                 PG.LinkedAttributeRefKey
+
+             FROM SHM.ShmShipmentBookingCartonDimension BCD
+
+                      JOIN ParentGroups PG
+                           ON PG.ShipmentBookingCartonDimensionId =
+                              COALESCE(
+                                      BCD.ParentCartonDimensionId,
+                                      BCD.ShipmentBookingCartonDimensionId
+                              )
+
+             WHERE BCD.ShipmentBookingId = @pShipmentBookingId
+               AND BCD.Active = 'Y';
+
+        -- Step 5: UPSERT ShmShipmentBookingCartonDimension
+        -- Order: parents first (5A-1, 5B-1) â†’ resolve child ParentCartonDimensionId
+        --        â†’ children (5A-2, 5B-2) â†’ deactivate removed rows â†’ update BCI
+        -- Match key: CartonInfoId + LinkedAttributeRefKey + CartonLength/Width/Height
+
+        BEGIN TRANSACTION;
+
+        -- 5A-1: UPDATE existing parent/SOLID rows; capture PKs into #tInsertedOutput for child resolution
+        MERGE INTO SHM.ShmShipmentBookingCartonDimension AS TARGET
+        USING
+            (
+                SELECT
+                    ST.RowNum
+                     , ST.PackType, ST.LineType
+                     , ST.CartonLength, ST.CartonWidth, ST.CartonHeight
+                     , ST.CartonWeight, ST.NoOfCartons
+                     , ST.AssortmentQty, ST.AssortmentNum, ST.Remarks
+                     , E.ShipmentBookingCartonDimensionId
+                FROM #tImportStage ST
+                         JOIN #tExistingBCD E
+                              ON  E.CartonInfoId                      = ST.AttributeRefKey
+                                  AND ISNULL(E.LinkedAttributeRefKey, '') = ISNULL(ST.LinkedAttributeRefKey, '')
+                                  AND E.CartonLength                      = ST.CartonLength
+                                  AND E.CartonWidth                       = ST.CartonWidth
+                                  AND E.CartonHeight                      = ST.CartonHeight
+                WHERE ST.ParentCartonInfoId IS NULL
+                  AND (ST.LineType = 'PARENT' OR ST.PackType = 'SOLID')
+            ) AS SOURCE
+        ON TARGET.ShipmentBookingCartonDimensionId = SOURCE.ShipmentBookingCartonDimensionId
+        WHEN MATCHED THEN UPDATE SET
+            TARGET.PackType                = SOURCE.PackType
+                                   , TARGET.LineType                = SOURCE.LineType
+                                   , TARGET.ParentCartonInfoId      = NULL
+                                   , TARGET.ParentCartonDimensionId = NULL
+                                   , TARGET.CartonLength            = SOURCE.CartonLength
+                                   , TARGET.CartonWidth             = SOURCE.CartonWidth
+                                   , TARGET.CartonHeight            = SOURCE.CartonHeight
+                                   , TARGET.CartonWeight            = SOURCE.CartonWeight
+                                   , TARGET.NoOfCartons             = SOURCE.NoOfCartons
+                                   , TARGET.AssortmentShipQty       = SOURCE.AssortmentQty
+                                   , TARGET.AssortmentNo            = SOURCE.AssortmentNum
+                                   , TARGET.Remarks                 = SOURCE.Remarks
+                                   , TARGET.CbmPerCtn              = ROUND(
+                    (SOURCE.CartonLength * @lMeterConversionRate)
+                        * (SOURCE.CartonWidth  * @lMeterConversionRate)
+                        * (SOURCE.CartonHeight * @lMeterConversionRate)
+                , 2)
+                                   , TARGET.TotalCbm                = ROUND(
+                    (SOURCE.CartonLength * @lMeterConversionRate)
+                        * (SOURCE.CartonWidth  * @lMeterConversionRate)
+                        * (SOURCE.CartonHeight * @lMeterConversionRate)
+                        * SOURCE.NoOfCartons
+                , 2)
+                                   , TARGET.LastUpdatedBy           = @pUserId
+                                   , TARGET.LastUpdatedDate         = GETUTCDATE()
+            OUTPUT SOURCE.RowNum, INSERTED.ShipmentBookingCartonDimensionId
+                INTO #tInsertedOutput (SourceRowNum, ActualId);
+
+        -- 5B-1: INSERT new parent/SOLID rows; capture PKs into #tInsertedOutput for child resolution
+        MERGE INTO SHM.ShmShipmentBookingCartonDimension AS TARGET
+        USING
+            (
+                SELECT
+                    ST.RowNum
+                     , ST.AttributeRefKey
+                     , ST.PackType
+                     , ST.LineType
+                     , ST.CartonLength
+                     , ST.CartonWidth
+                     , ST.CartonHeight
+                     , ST.CartonWeight
+                     , ST.NoOfCartons
+                     , ST.AssortmentQty
+                     , ST.AssortmentNum
+                     , ST.Remarks
+                FROM #tImportStage ST
+                WHERE ST.ParentCartonInfoId IS NULL
+                  AND NOT EXISTS
+                    (
+                        SELECT 1
+                        FROM #tExistingBCD E
+                        WHERE E.CartonInfoId                      = ST.AttributeRefKey
+                          AND ISNULL(E.LinkedAttributeRefKey, '') = ISNULL(ST.LinkedAttributeRefKey, '')
+                          AND E.CartonLength                      = ST.CartonLength
+                          AND E.CartonWidth                       = ST.CartonWidth
+                          AND E.CartonHeight                      = ST.CartonHeight
+                    )
+            ) AS SOURCE
+        ON 1 = 0
+        WHEN NOT MATCHED THEN
+            INSERT
+            (
+              ShipmentBookingId, CartonInfoId, PackType, LineType
+            , ParentCartonInfoId, ParentCartonDimensionId
+            , CartonLength, CartonWidth, CartonHeight
+            , CartonWeight, NoOfCartons
+            , AssortmentShipQty, AssortmentNo, Remarks
+            , CbmPerCtn, TotalCbm
+            , Active, CreatedBy, CreatedDate, LastUpdatedBy, LastUpdatedDate
+            )
+            VALUES
+                (
+                  @pShipmentBookingId, SOURCE.AttributeRefKey, SOURCE.PackType, SOURCE.LineType
+                , NULL, NULL
+                , SOURCE.CartonLength, SOURCE.CartonWidth, SOURCE.CartonHeight
+                , SOURCE.CartonWeight, SOURCE.NoOfCartons
+                , SOURCE.AssortmentQty, SOURCE.AssortmentNum, SOURCE.Remarks
+                , ROUND(
+                          (SOURCE.CartonLength * @lMeterConversionRate)
+                              * (SOURCE.CartonWidth  * @lMeterConversionRate)
+                              * (SOURCE.CartonHeight * @lMeterConversionRate)
+                      , 2) , ROUND(
+                          (SOURCE.CartonLength * @lMeterConversionRate)
+                              * (SOURCE.CartonWidth  * @lMeterConversionRate)
+                              * (SOURCE.CartonHeight * @lMeterConversionRate)
+                              * SOURCE.NoOfCartons
+                      , 2)
+                , 'Y', @pUserId, GETUTCDATE(), @pUserId, GETUTCDATE()
+                )
+            OUTPUT SOURCE.RowNum, INSERTED.ShipmentBookingCartonDimensionId
+                INTO #tInsertedOutput (SourceRowNum, ActualId);
+
+        -- Resolve NewParentCartonDimensionId for child staging rows using #tInsertedOutput
+        -- #tInsertedOutput holds PKs of all parent rows touched in 5A-1 and 5B-1
+        UPDATE CHILD
+        SET CHILD.NewParentCartonDimensionId = IO.ActualId
+        FROM #tImportStage CHILD
+                 JOIN #tInsertedOutput IO
+                      ON IO.SourceRowNum = CHILD.ParentRowNum
+        WHERE CHILD.LineType = 'CHILD'
+          AND CHILD.ParentRowNum IS NOT NULL;
+
+        -- Fallback: resolve for children whose parent existed in DB but was not in this upload
+        UPDATE CHILD
+        SET CHILD.NewParentCartonDimensionId = E_PAR.ShipmentBookingCartonDimensionId
+        FROM #tImportStage CHILD
+                 JOIN #tImportStage PARENT
+                      ON PARENT.RowNum = CHILD.ParentRowNum
+                 JOIN #tExistingBCD E_PAR
+                      ON  E_PAR.CartonInfoId                      = PARENT.AttributeRefKey
+                          AND ISNULL(E_PAR.LinkedAttributeRefKey, '') = ISNULL(PARENT.LinkedAttributeRefKey, '')
+                          AND E_PAR.ParentCartonInfoId                IS NULL
+                          AND E_PAR.CartonLength                      = PARENT.CartonLength
+                          AND E_PAR.CartonWidth                       = PARENT.CartonWidth
+                          AND E_PAR.CartonHeight                      = PARENT.CartonHeight
+        WHERE CHILD.LineType = 'CHILD'
+          AND CHILD.NewParentCartonDimensionId IS NULL;
+
+        -- 5A-2: UPDATE existing child rows; ParentCartonDimensionId set from pre-resolved NewParentCartonDimensionId
+        UPDATE BCD
+        SET
+            BCD.PackType                = ST.PackType
+          , BCD.LineType                = ST.LineType
+          , BCD.ParentCartonInfoId      = ST.ParentCartonInfoId
+          , BCD.ParentCartonDimensionId = ST.NewParentCartonDimensionId
+          , BCD.CartonLength            = ST.CartonLength
+          , BCD.CartonWidth             = ST.CartonWidth
+          , BCD.CartonHeight            = ST.CartonHeight
+          , BCD.CartonWeight            = ST.CartonWeight
+          , BCD.NoOfCartons             = ST.NoOfCartons
+          , BCD.AssortmentShipQty       = ST.AssortmentQty
+          , BCD.AssortmentNo            = ST.AssortmentNum
+          , BCD.Remarks                 = ST.Remarks
+          , BCD.CbmPerCtn              = ROUND((ST.CartonLength * @lMeterConversionRate)
+                                                   * (ST.CartonWidth  * @lMeterConversionRate)
+                                                   * (ST.CartonHeight * @lMeterConversionRate),2)
+          , BCD.TotalCbm               = ROUND((ST.CartonLength * @lMeterConversionRate)
+                                                   * (ST.CartonWidth  * @lMeterConversionRate)
+                                                   * (ST.CartonHeight * @lMeterConversionRate)
+                                                   * ST.NoOfCartons,2)
+          , BCD.LastUpdatedBy           = @pUserId
+          , BCD.LastUpdatedDate         = GETUTCDATE()
+        FROM SHM.ShmShipmentBookingCartonDimension BCD
+                 JOIN #tExistingBCD E
+                      ON E.ShipmentBookingCartonDimensionId = BCD.ShipmentBookingCartonDimensionId
+                 JOIN #tImportStage ST
+                      ON  ST.AttributeRefKey                    = E.CartonInfoId
+                          AND ISNULL(ST.LinkedAttributeRefKey, '')  = ISNULL(E.LinkedAttributeRefKey, '')
+                          AND ST.CartonLength                       = E.CartonLength
+                          AND ST.CartonWidth                        = E.CartonWidth
+                          AND ST.CartonHeight                       = E.CartonHeight
+        WHERE ST.LineType = 'CHILD';
+
+        -- 5B-2: INSERT new child rows; ParentCartonDimensionId already resolved in NewParentCartonDimensionId
+        INSERT INTO SHM.ShmShipmentBookingCartonDimension
+        (
+          ShipmentBookingId, CartonInfoId, PackType, LineType
+        , ParentCartonInfoId, ParentCartonDimensionId
+        , CartonLength, CartonWidth, CartonHeight
+        , CartonWeight, NoOfCartons
+        , AssortmentShipQty, AssortmentNo, Remarks
+        , CbmPerCtn, TotalCbm
+        , Active, CreatedBy, CreatedDate, LastUpdatedBy, LastUpdatedDate
+        )
+        SELECT
+            @pShipmentBookingId
+             , ST.AttributeRefKey
+             , ST.PackType
+             , ST.LineType
+             , ST.ParentCartonInfoId
+             , ST.NewParentCartonDimensionId
+             , ST.CartonLength
+             , ST.CartonWidth
+             , ST.CartonHeight
+             , ST.CartonWeight
+             , ST.NoOfCartons
+             , ST.AssortmentQty
+             , ST.AssortmentNum
+             , ST.Remarks
+             , ROUND(
+                (ST.CartonLength * @lMeterConversionRate)
+                    * (ST.CartonWidth  * @lMeterConversionRate)
+                    * (ST.CartonHeight * @lMeterConversionRate)
+            , 2) , ROUND(
+                (ST.CartonLength * @lMeterConversionRate)
+                    * (ST.CartonWidth  * @lMeterConversionRate)
+                    * (ST.CartonHeight * @lMeterConversionRate)
+                    * ST.NoOfCartons
+            , 2)
+             , 'Y', @pUserId, GETUTCDATE(), @pUserId, GETUTCDATE()
+        FROM #tImportStage ST
+        WHERE ST.LineType = 'CHILD'
+          AND ST.NewParentCartonDimensionId IS NOT NULL
+          AND NOT EXISTS
+            (
+                SELECT 1
+                FROM #tExistingBCD E
+                WHERE E.CartonInfoId                      = ST.AttributeRefKey
+                  AND ISNULL(E.LinkedAttributeRefKey, '') = ISNULL(ST.LinkedAttributeRefKey, '')
+                  AND E.CartonLength                      = ST.CartonLength
+                  AND E.CartonWidth                       = ST.CartonWidth
+                  AND E.CartonHeight                      = ST.CartonHeight
+            );
+
+        -- Deactivate BCD rows that existed before but are absent from the current upload
+        UPDATE BCD
+        SET Active = 'D', LastUpdatedBy = @pUserId, LastUpdatedDate = GETUTCDATE()
+        FROM SHM.ShmShipmentBookingCartonDimension BCD
+                 JOIN #tExistingBCD E
+                      ON E.ShipmentBookingCartonDimensionId = BCD.ShipmentBookingCartonDimensionId
+        WHERE NOT EXISTS
+            (
+                SELECT 1
+                FROM #tImportStage ST
+                WHERE ST.AttributeRefKey              = E.CartonInfoId
+                  AND ISNULL(ST.LinkedAttributeRefKey,'') = ISNULL(E.LinkedAttributeRefKey,'')
+                  AND ST.CartonLength                 = E.CartonLength
+                  AND ST.CartonWidth                  = E.CartonWidth
+                  AND ST.CartonHeight                 = E.CartonHeight
+            )
+          AND BCD.Active = 'Y';
+
+        -- 5D: Update ShmShipmentBookingCartonInfo with updated PackType, AssortmentShipQty, and CBM
+        ;WITH CTE_PackTypes AS
+                  (
+                      SELECT
+                          CartonInfoId
+                           , STRING_AGG(PackType, ', ') WITHIN GROUP (ORDER BY PackType) AS ResolvedPackType
+                      FROM (
+                               SELECT DISTINCT
+                                   CartonInfoId
+                                             , PackType
+                               FROM SHM.ShmShipmentBookingCartonDimension
+                               WHERE ShipmentBookingId = @pShipmentBookingId
+                                 AND Active            = 'Y'
+                                 AND PackType          IS NOT NULL
+                                 AND PackType          != ''
+                           ) D
+                      GROUP BY CartonInfoId
+                  ),
+              CTE_CartonInfoUpdate AS
+                  (
+                      SELECT
+                          ST.AttributeRefKey
+                           , MAX(PT.ResolvedPackType)  AS ResolvedPackType
+                           , SUM(ST.AssortmentQty)     AS TotalAssortmentQty
+                      FROM #tImportStage ST
+                               LEFT JOIN CTE_PackTypes PT ON PT.CartonInfoId = ST.AttributeRefKey
+                      GROUP BY ST.AttributeRefKey
+                  )
+         UPDATE BCI
+         SET
+             BCI.PackType          = CTE.ResolvedPackType
+           , BCI.AssortmentShipQty = CTE.TotalAssortmentQty
+           , BCI.CBM               = (
+             SELECT ROUND(SUM(D.TotalCbm), 2)
+             FROM SHM.ShmShipmentBookingCartonDimension D
+             WHERE D.ShipmentBookingId = @pShipmentBookingId
+               AND D.CartonInfoId = BCI.CartonInfoId
+               AND D.ParentCartonInfoId IS NULL
+               AND D.Active = 'Y'
+         )
+           , BCI.LastUpdatedBy     = @pUserId
+           , BCI.LastUpdatedDate   = GETUTCDATE()
+         FROM SHM.ShmShipmentBookingCartonInfo BCI
+                  JOIN CTE_CartonInfoUpdate CTE
+                       ON  CTE.AttributeRefKey    = BCI.CartonInfoId
+                           AND BCI.ShipmentBookingId  = @pShipmentBookingId
+                           AND BCI.Active             = 'Y';
+
+        UPDATE #tImportStage
+        SET ResultMsg = '-',
+            ErrorMsg  = NULL,
+            Created   = 1;
+
+        IF @@TRANCOUNT > 0 COMMIT TRANSACTION;
+
+        SET @xRetCode = 1;
+        SET @xMsg     = 'Carton dimension data imported successfully.';
+        SET @xData    = CAST((SELECT * FROM #tImportStage FOR JSON PATH) AS TEXT);
+
+        SELECT * FROM #tImportStage;
+
+    END TRY
+    BEGIN CATCH
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
+
+        DROP TABLE IF EXISTS #tInsertedOutput;
+        DROP TABLE IF EXISTS #tExistingBCD;
+
+        SET @xRetCode = -1;
+        SET @xMsg = 'Error at line ' + CAST(ERROR_LINE() AS VARCHAR) + ': ' + ERROR_MESSAGE();
+
+        UPDATE #tImportStage
+        SET ResultMsg = @xMsg,
+            ErrorMsg  = @xMsg,
+            Created   = 0
+        WHERE Created IS NULL;
+
+        SET @xData = CAST((SELECT * FROM #tImportStage FOR JSON PATH) AS TEXT);
+
+        SELECT * FROM #tImportStage;
+    END CATCH;
+END;
